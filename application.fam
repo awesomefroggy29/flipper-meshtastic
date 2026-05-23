@@ -1,0 +1,20 @@
+App(
+    appid="fliptastic",
+    name="Fliptastic",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="meshtastic_app_entry",
+    requires=["gui"],
+    stack_size=8192,
+    fap_category="Meshtastic",
+    fap_icon="icon.png",
+    sources=[
+        "src/meshtastic.c",
+        "src/meshtastic_spi.c",
+        "src/meshtastic_radio.c",
+        "src/meshtastic_protocol.c",
+        "src/meshtastic_crypto.c",
+        "src/third_party/curve25519-donna.c",
+        "src/third_party/sha256.c",
+    ],
+    fap_version="0.5",
+)

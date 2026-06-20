@@ -24,7 +24,15 @@ An app for the flipper zero that works with the rfm95w from Adafruit to create a
 <br>
 
 # this is how i wrapped my wires to fit:
-<img width="3024" height="4032" alt="image" src="https://github.com/user-attachments/assets/d1429632-bd83-4453-a0ad-491a28bc4418" />
-<img width="4032" height="3024" alt="image" src="https://github.com/user-attachments/assets/3e10238a-8f1d-4ad1-b2f0-fc81cba550e3" />
+<img width="384" height="512" alt="image" src="https://github.com/user-attachments/assets/d1429632-bd83-4453-a0ad-491a28bc4418" />
+<img width="512" height="384" alt="image" src="https://github.com/user-attachments/assets/3e10238a-8f1d-4ad1-b2f0-fc81cba550e3" />
+<br>
+<h2>now if you did everything right, and each wire is plugged in(triple check that they are correct, you really do not want to break your flipper), then you can go into your apps on your flipper, scroll down to the meshtastic folder, and open fliptastic. if it says rfm95w not found, then you did something wrong. it could be that you didnt solder well, you didnt plug in the wires to the right places, you might have bought the 433mhz version of the radio module, the pins are loose, etc. check everything. if you see a menu with an inbox, then it worked. your flipper will automatically broadcast its name and id, and you can message people. if you go into settings, you get a variety of settings to change. if your area has a specific channel and frequency that many people use, you can set it there. you can also change your meshtastic name.</h2>
+
+# hopefully this worked for you. if you like this project, consider starring it. thank you!
+
+
+<h3>now for some information</h3>
+<p>in the inbox when you send a message, it will start out with a "-" next to it. that means its waiting for acknowledgement. if it turns to a "=" then it was not acknowledged. if it turns to a "+", then it was. if you see a "<>" in someone's message, then it was probably an emoji or special character.</p>
 
 

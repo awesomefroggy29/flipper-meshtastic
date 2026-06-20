@@ -24,3 +24,7 @@ An app for the flipper zero that works with the rfm95w from Adafruit to create a
 <br>
 
 # this is how i wrapped my wires to fit:
+<img width="3024" height="4032" alt="image" src="https://github.com/user-attachments/assets/d1429632-bd83-4453-a0ad-491a28bc4418" />
+<img width="4032" height="3024" alt="image" src="https://github.com/user-attachments/assets/3e10238a-8f1d-4ad1-b2f0-fc81cba550e3" />
+
+

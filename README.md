@@ -4,8 +4,10 @@ An app for the flipper zero that works with the rfm95w from Adafruit to create a
 <h2>This app is specifically designed for people IN THE US. If you are not in the US, then it could be illegal. check online if 915mhz LoRa radio/meshtastic on 915mhz is legal.</h2>
 <br>
 <br>
+
 # if you want to make this at home, please read the entire instructions below from start to finish before buying or doing anything so you know what you are doing.
 <br>
+
 # how to make it at home
 <h3>first off, you need a flipper, a usb cable that can connect from your pc to your flipper, an sd card in your flipper, a soldering iron(highly recommended to use a wedge tip for soldering), soldering tin, one male to male jumper wire, 6 male to female jumper wires, 6 male pin headers, a paperclip or a proper 915mhz LoRa antenna that you know how to connect, and an rfm95w breakout board from https://www.adafruit.com/product/3072?srsltid=AfmBOoqABd6jpjQfJQPfLfAXuoDvxvfKwun1KpBl1ytZ675R-qUJ0RXz (this was previously on amazon, but now the only one on amazon is the 433mhz version. DO NOT USE THE 433MHZ VERSION AS IT WILL NOT WORK AND WILL PROBABLY CATCH ON FIRE!!!!!!! You may be able to search "adafruit 3072" on amazon to find it, but at the time of making this, it is not on amazon. do not buy the 3073 version as it is the 433mhz version).</h3>
 <br>

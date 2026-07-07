@@ -19,10 +19,13 @@
 #define MESSAGES_PATH APP_DATA_PATH("meshtastic/messages.bin")
 #define DM_MESSAGES_PATH APP_DATA_PATH("meshtastic/dm_messages.bin")
 #define NODES_PATH APP_DATA_PATH("meshtastic/nodes.bin")
+#define WEATHER_PATH APP_DATA_PATH("meshtastic/weather.bin")
 #define PACKET_CACHE_PATH APP_DATA_PATH("meshtastic/packet_cache.bin")
 #define LOGS_DIR APP_DATA_PATH("meshtastic/logs")
 #define MESSAGES_MAGIC 0x4D534854u
 #define MESSAGES_VERSION 2
+#define WEATHER_MAGIC 0x57454852u
+#define WEATHER_VERSION 1
 #define PACKET_CACHE_MAGIC 0x504B5443u
 #define PACKET_CACHE_VERSION 1
 #define PACKET_CACHE_TTL_SEC (30 * 60)
@@ -95,6 +98,7 @@ typedef enum {
     SettingItemNodeinfoInterval,
     SettingItemMessageLimit,
     SettingItemPolitenessAdvanced,
+    SettingItemClearLogs,
     SettingItemRegion,
     SettingItemShortName,
     SettingItemLongName,
@@ -103,6 +107,7 @@ typedef enum {
     SettingItemChannelCustom,
     SettingItemClear,
     SettingItemClearNodes,
+    SettingItemClearWeather,
     SettingItemResetKeys,
     SettingItemReset,
     SettingItemCount,
@@ -118,7 +123,6 @@ typedef enum {
     PoliteItemMaxWait,
     PoliteItemRelayMinDelay,
     PoliteItemRelayMaxDelay,
-    PoliteItemClearLogs,
     PoliteItemBack,
     PoliteItemCount,
 } PolitenessSettingItem;
@@ -324,6 +328,31 @@ typedef struct {
     int8_t last_rssi;
     int8_t last_snr;
 } NodeFileRecordV8;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t count;
+    uint32_t saved_ts;
+} WeatherFileHeaderV1;
+
+typedef struct {
+    uint32_t node_id;
+    uint32_t age;
+    uint8_t valid;
+    uint8_t has_temperature;
+    float temperature;
+    uint8_t has_humidity;
+    float humidity;
+    uint8_t has_pressure;
+    float pressure;
+    uint8_t has_wind_direction;
+    uint16_t wind_direction;
+    uint8_t has_wind_speed;
+    float wind_speed;
+    uint8_t has_wind_gust;
+    float wind_gust;
+} WeatherFileRecordV1;
 
 typedef struct {
     uint32_t magic;
@@ -1712,14 +1741,121 @@ static void nodes_load(MeshtasticApp* app) {
     }
 }
 
-static void nodes_clear(MeshtasticApp* app) {
-    nodes_reset(app);
+static void weather_sort(MeshtasticApp* app) {
+    if(!app) return;
+    for(uint8_t i = 0; i < app->weather_count; i++) {
+        for(uint8_t j = 0; j + 1 < app->weather_count - i; j++) {
+            if(app->weather[j].last_heard < app->weather[j + 1].last_heard) {
+                WeatherInfo tmp = app->weather[j];
+                app->weather[j] = app->weather[j + 1];
+                app->weather[j + 1] = tmp;
+            }
+        }
+    }
+    if(app->weather_scroll >= app->weather_count) {
+        app->weather_scroll = app->weather_count ? app->weather_count - 1 : 0;
+    }
+}
+
+static void weather_save(MeshtasticApp* app) {
+    if(!app || !app->storage) return;
+    File* file = storage_file_alloc(app->storage);
+    if(!file) return;
+    if(storage_file_open(file, WEATHER_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        WeatherFileHeaderV1 hdr = {
+            .magic = WEATHER_MAGIC,
+            .version = WEATHER_VERSION,
+            .count = app->weather_count,
+            .saved_ts = furi_hal_rtc_get_timestamp(),
+        };
+        storage_file_write(file, &hdr, sizeof(hdr));
+        for(uint8_t i = 0; i < app->weather_count; i++) {
+            WeatherInfo* weather = &app->weather[i];
+            WeatherFileRecordV1 rec = {0};
+            rec.node_id = weather->node_id;
+            if(hdr.saved_ts >= weather->last_heard) {
+                rec.age = hdr.saved_ts - weather->last_heard;
+            }
+            rec.valid = weather->valid;
+            rec.has_temperature = weather->has_temperature ? 1 : 0;
+            rec.temperature = weather->temperature;
+            rec.has_humidity = weather->has_humidity ? 1 : 0;
+            rec.humidity = weather->humidity;
+            rec.has_pressure = weather->has_pressure ? 1 : 0;
+            rec.pressure = weather->pressure;
+            rec.has_wind_direction = weather->has_wind_direction ? 1 : 0;
+            rec.wind_direction = weather->wind_direction;
+            rec.has_wind_speed = weather->has_wind_speed ? 1 : 0;
+            rec.wind_speed = weather->wind_speed;
+            rec.has_wind_gust = weather->has_wind_gust ? 1 : 0;
+            rec.wind_gust = weather->wind_gust;
+            storage_file_write(file, &rec, sizeof(rec));
+        }
+        storage_file_close(file);
+    }
+    storage_file_free(file);
+}
+
+static void weather_load(MeshtasticApp* app) {
+    if(!app || !app->storage) return;
+    if(!storage_file_exists(app->storage, WEATHER_PATH)) return;
+    File* file = storage_file_alloc(app->storage);
+    if(!file) return;
+    if(storage_file_open(file, WEATHER_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        WeatherFileHeaderV1 hdr = {0};
+        if(storage_file_read(file, &hdr, sizeof(hdr)) == sizeof(hdr) &&
+           hdr.magic == WEATHER_MAGIC &&
+           hdr.version == WEATHER_VERSION) {
+            weather_reset(app);
+            uint8_t count = hdr.count;
+            if(count > MAX_WEATHER_NODES) count = MAX_WEATHER_NODES;
+            uint32_t now = furi_hal_rtc_get_timestamp();
+            uint32_t delta = 0;
+            if(hdr.saved_ts > 0 && now > hdr.saved_ts) {
+                delta = now - hdr.saved_ts;
+            }
+            for(uint8_t i = 0; i < count; i++) {
+                WeatherFileRecordV1 rec = {0};
+                if(storage_file_read(file, &rec, sizeof(rec)) != sizeof(rec)) break;
+                if(rec.node_id == 0) continue;
+                WeatherInfo weather = {0};
+                weather.node_id = rec.node_id;
+                uint32_t age = rec.age + delta;
+                weather.last_heard = (now > age) ? (now - age) : 0;
+                weather.valid = rec.valid;
+                weather.has_temperature = rec.has_temperature ? true : false;
+                weather.temperature = rec.temperature;
+                weather.has_humidity = rec.has_humidity ? true : false;
+                weather.humidity = rec.humidity;
+                weather.has_pressure = rec.has_pressure ? true : false;
+                weather.pressure = rec.pressure;
+                weather.has_wind_direction = rec.has_wind_direction ? true : false;
+                weather.wind_direction = rec.wind_direction;
+                weather.has_wind_speed = rec.has_wind_speed ? true : false;
+                weather.wind_speed = rec.wind_speed;
+                weather.has_wind_gust = rec.has_wind_gust ? true : false;
+                weather.wind_gust = rec.wind_gust;
+                app->weather[app->weather_count++] = weather;
+            }
+            weather_sort(app);
+        }
+        storage_file_close(file);
+    }
+    storage_file_free(file);
+}
+
+static void weather_clear(MeshtasticApp* app) {
     weather_reset(app);
-    nodes_save(app);
+    weather_save(app);
     if(app) {
         meshtastic_update_weather_label(app);
         if(app->current_view == ViewIdWeather) weather_redraw(app);
     }
+}
+
+static void nodes_clear(MeshtasticApp* app) {
+    nodes_reset(app);
+    nodes_save(app);
 }
 
 static size_t encode_key(uint32_t field, uint8_t wire, uint8_t* out, size_t cap) {
@@ -2355,19 +2491,8 @@ void meshtastic_store_weather(MeshtasticApp* app, uint32_t node_id, const Weathe
     saved.valid = 1;
     *dst = saved;
 
-    for(uint8_t i = 0; i < app->weather_count; i++) {
-        for(uint8_t j = 0; j + 1 < app->weather_count - i; j++) {
-            if(app->weather[j].last_heard < app->weather[j + 1].last_heard) {
-                WeatherInfo tmp = app->weather[j];
-                app->weather[j] = app->weather[j + 1];
-                app->weather[j + 1] = tmp;
-            }
-        }
-    }
-
-    if(app->weather_scroll >= app->weather_count) {
-        app->weather_scroll = app->weather_count ? app->weather_count - 1 : 0;
-    }
+    weather_sort(app);
+    weather_save(app);
     meshtastic_update_weather_label(app);
     if(app->current_view == ViewIdWeather) weather_redraw(app);
 }
@@ -3933,7 +4058,7 @@ static bool settings_is_cycleable(MeshtasticApp* app, uint32_t item) {
         return false;
     }
     if(app && app->settings_advanced) {
-        return item != PoliteItemBack && item != PoliteItemClearLogs;
+        return item != PoliteItemBack;
     }
 
     switch(item) {
@@ -3997,9 +4122,6 @@ static void settings_get_label(MeshtasticApp* app, uint32_t item, char* out, siz
         case PoliteItemRelayMaxDelay:
             snprintf(out, out_size, "Relay max: %u ms", (unsigned)app->rebroadcast_max_delay_ms);
             break;
-        case PoliteItemClearLogs:
-            snprintf(out, out_size, "Clear logs");
-            break;
         case PoliteItemBack:
             snprintf(out, out_size, "Back");
             break;
@@ -4057,11 +4179,17 @@ static void settings_get_label(MeshtasticApp* app, uint32_t item, char* out, siz
     case SettingItemPolitenessAdvanced:
         snprintf(out, out_size, "Advanced politeness");
         break;
+    case SettingItemClearLogs:
+        snprintf(out, out_size, "Clear logs");
+        break;
     case SettingItemClear:
         snprintf(out, out_size, "Clear inbox");
         break;
     case SettingItemClearNodes:
         snprintf(out, out_size, "Clear nodes");
+        break;
+    case SettingItemClearWeather:
+        snprintf(out, out_size, "Clear weather info");
         break;
     case SettingItemResetKeys:
         snprintf(out, out_size, "Reset PKI keys");
@@ -4132,9 +4260,8 @@ static void meshtastic_settings_draw(Canvas* canvas, void* model) {
         canvas_draw_str(canvas, 2, y + 8, label);
         if(settings_is_cycleable(app, item)) {
             canvas_draw_str_aligned(canvas, 126, y + 8, AlignRight, AlignBottom, "<>");
-        } else if(!app->settings_advanced && item == SettingItemPolitenessAdvanced) {
-            canvas_draw_str_aligned(canvas, 126, y + 8, AlignRight, AlignBottom, "menu");
-        } else if(app->settings_advanced && item == PoliteItemClearLogs) {
+        } else if(!app->settings_advanced &&
+                  (item == SettingItemPolitenessAdvanced || item == SettingItemClearLogs)) {
             canvas_draw_str_aligned(canvas, 126, y + 8, AlignRight, AlignBottom, "menu");
         } else if(app->settings_advanced || item != SettingItemRegion) {
             canvas_draw_str_aligned(canvas, 126, y + 8, AlignRight, AlignBottom, "OK");
@@ -4334,19 +4461,15 @@ static void settings_enter(void* ctx, uint32_t index) {
             logs_clear_all(app);
         } else {
             app->settings_log_clear = false;
-            app->settings_advanced = true;
-            app->settings_selected = PoliteItemClearLogs;
+            app->settings_advanced = false;
+            app->settings_selected = SettingItemClearLogs;
             app->settings_scroll = 0;
         }
         settings_redraw(app);
         return;
     }
     if(app->settings_advanced) {
-        if(index == PoliteItemClearLogs) {
-            app->settings_log_clear = true;
-            app->settings_selected = 0;
-            app->settings_scroll = 0;
-        } else if(index == PoliteItemBack) {
+        if(index == PoliteItemBack) {
             app->settings_advanced = false;
             app->settings_log_clear = false;
             app->settings_selected = SettingItemPolitenessAdvanced;
@@ -4424,6 +4547,12 @@ static void settings_enter(void* ctx, uint32_t index) {
         app->settings_selected = 0;
         app->settings_scroll = 0;
         settings_redraw(app);
+    } else if(index == SettingItemClearLogs) {
+        app->settings_advanced = false;
+        app->settings_log_clear = true;
+        app->settings_selected = 0;
+        app->settings_scroll = 0;
+        settings_redraw(app);
     } else if(index == SettingItemClear) {
         messages_clear(app);
         dm_messages_clear(app);
@@ -4433,6 +4562,9 @@ static void settings_enter(void* ctx, uint32_t index) {
         nodes_menu_rebuild(app);
         contacts_menu_rebuild(app);
         meshtastic_update_nodes_labels(app);
+        settings_refresh(app, false);
+    } else if(index == SettingItemClearWeather) {
+        weather_clear(app);
         settings_refresh(app, false);
     } else if(index == SettingItemResetKeys) {
         if(crypto_curve25519_generate_keypair(app->self_public_key, app->self_private_key)) {
@@ -4529,8 +4661,8 @@ static bool meshtastic_settings_input(InputEvent* event, void* ctx) {
     if(event->key == InputKeyBack) {
         if(app->settings_log_clear) {
             app->settings_log_clear = false;
-            app->settings_advanced = true;
-            app->settings_selected = PoliteItemClearLogs;
+            app->settings_advanced = false;
+            app->settings_selected = SettingItemClearLogs;
             app->settings_scroll = 0;
             settings_redraw(app);
             return true;
@@ -5112,6 +5244,8 @@ int32_t meshtastic_app_entry(void* p) {
     dm_messages_load(app);
     FURI_LOG_I("Main", "Nodes load start");
     nodes_load(app);
+    FURI_LOG_I("Main", "Weather load start");
+    weather_load(app);
     FURI_LOG_I("Main", "Storage loaded");
 
     app->submenu = submenu_alloc();
@@ -5255,6 +5389,7 @@ int32_t meshtastic_app_entry(void* p) {
         packet_cache_save(app);
     }
     nodes_save(app);
+    weather_save(app);
 
     rfm95w_set_dio0_interrupt(app, false);
     view_dispatcher_remove_view(app->view_dispatcher, ViewIdLogText);

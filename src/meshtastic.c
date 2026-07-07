@@ -31,7 +31,7 @@
 #define PACKET_CACHE_TTL_SEC (30 * 60)
 #define SETTINGS_PATH APP_DATA_PATH("meshtastic/settings_v6.bin")
 #define SETTINGS_MAGIC 0x4D534747u
-#define SETTINGS_VERSION 8
+#define SETTINGS_VERSION 9
 #define NODEINFO_BURST_COUNT 0
 #define NODEINFO_BURST_INTERVAL_MS 1000
 #define RADIO_STARTUP_DELAY_MS 1000
@@ -97,6 +97,7 @@ typedef enum {
     SettingItemRole,
     SettingItemNodeinfoInterval,
     SettingItemMessageLimit,
+    SettingItemTemperatureUnit,
     SettingItemPolitenessAdvanced,
     SettingItemClearLogs,
     SettingItemRegion,
@@ -482,6 +483,36 @@ typedef struct {
     uint16_t rebroadcast_min_delay_ms;
     uint16_t rebroadcast_max_delay_ms;
 } SettingsFileV8;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t max_hops;
+    uint8_t preset_index;
+    uint8_t freq_slot;
+    uint8_t tx_power_dbm;
+    uint8_t role_index;
+    uint8_t nodeinfo_interval_index;
+    uint8_t channel_preset_index;
+    uint8_t channel_psk_len;
+    char channel_name[16];
+    char self_short_name[5];
+    char self_long_name[37];
+    uint8_t channel_psk[32];
+    uint8_t private_key[32];
+    uint8_t public_key[32];
+    uint8_t message_limit_index;
+    uint8_t politeness_enabled;
+    uint8_t cad_enabled;
+    uint8_t rssi_fallback_enabled;
+    int8_t rssi_busy_threshold_dbm;
+    uint16_t min_backoff_ms;
+    uint16_t max_backoff_ms;
+    uint16_t max_tx_wait_ms;
+    uint16_t rebroadcast_min_delay_ms;
+    uint16_t rebroadcast_max_delay_ms;
+    uint8_t weather_fahrenheit;
+} SettingsFileV9;
 
 // US region (Meshtastic)
 #define REGION_US_FREQ_START_MHZ 902.0f
@@ -1038,6 +1069,7 @@ static void settings_defaults(MeshtasticApp* app) {
     app->nodeinfo_interval_ms = nodeinfo_intervals_ms[app->nodeinfo_interval_index];
     app->message_limit_index = 0;
     app->message_limit = message_limit_values[app->message_limit_index];
+    app->weather_fahrenheit = false;
     app->channel_preset_index = 0;
     app->channel_psk_len = 1;
     app->channel_psk[0] = 0x01;
@@ -1065,7 +1097,7 @@ static void settings_save(MeshtasticApp* app) {
     File* file = storage_file_alloc(app->storage);
     if(!file) return;
     if(storage_file_open(file, SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        SettingsFileV8 data = {
+        SettingsFileV9 data = {
             .magic = SETTINGS_MAGIC,
             .version = SETTINGS_VERSION,
             .max_hops = app->max_hops,
@@ -1086,6 +1118,7 @@ static void settings_save(MeshtasticApp* app) {
             .max_tx_wait_ms = app->max_tx_wait_ms,
             .rebroadcast_min_delay_ms = app->rebroadcast_min_delay_ms,
             .rebroadcast_max_delay_ms = app->rebroadcast_max_delay_ms,
+            .weather_fahrenheit = app->weather_fahrenheit ? 1 : 0,
         };
         memcpy(data.channel_name, app->channel_name, sizeof(data.channel_name));
         memcpy(data.self_short_name, app->self_short_name, sizeof(data.self_short_name));
@@ -1110,7 +1143,7 @@ static void settings_load(MeshtasticApp* app) {
     FURI_LOG_I("Main", "Settings load: file alloc");
     if(storage_file_open(file, SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         FURI_LOG_I("Main", "Settings load: file open");
-        SettingsFileV8 data = {0};
+        SettingsFileV9 data = {0};
         size_t read = storage_file_read(file, &data, sizeof(data));
         FURI_LOG_I("Main", "Settings load: read %u", (unsigned)read);
         if(read >= sizeof(SettingsFileV2) && data.magic == SETTINGS_MAGIC) {
@@ -1197,6 +1230,13 @@ static void settings_load(MeshtasticApp* app) {
                         app->rebroadcast_min_delay_ms = v8->rebroadcast_min_delay_ms;
                         app->rebroadcast_max_delay_ms = v8->rebroadcast_max_delay_ms;
                         settings_clamp_politeness(app);
+                        if(data.version >= 9 && read >= sizeof(SettingsFileV9)) {
+                            SettingsFileV9* v9 = (SettingsFileV9*)&data;
+                            app->weather_fahrenheit = v9->weather_fahrenheit ? true : false;
+                        } else {
+                            app->weather_fahrenheit = false;
+                            settings_dirty = true;
+                        }
                     } else {
                         settings_dirty = true;
                     }
@@ -3871,6 +3911,14 @@ static float weather_dew_point_c(float temperature_c, float humidity) {
     return temperature_c - ((100.0f - humidity) / 5.0f);
 }
 
+static float weather_display_temp(MeshtasticApp* app, float temperature_c) {
+    return (app && app->weather_fahrenheit) ? ((temperature_c * 9.0f / 5.0f) + 32.0f) : temperature_c;
+}
+
+static char weather_temp_unit(MeshtasticApp* app) {
+    return (app && app->weather_fahrenheit) ? 'F' : 'C';
+}
+
 static const char* weather_direction_label(uint16_t degrees) {
     static const char* dirs[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
     return dirs[((degrees + 22) % 360) / 45];
@@ -3935,9 +3983,10 @@ static void meshtastic_weather_draw(Canvas* canvas, void* model) {
         snprintf(
             line,
             sizeof(line),
-            "%s %.1fC",
+            "%s %.1f%c",
             weather_condition_label(weather),
-            (double)weather->temperature);
+            (double)weather_display_temp(app, weather->temperature),
+            weather_temp_unit(app));
     } else {
         snprintf(line, sizeof(line), "%s", weather_condition_label(weather));
     }
@@ -3947,9 +3996,10 @@ static void meshtastic_weather_draw(Canvas* canvas, void* model) {
         snprintf(
             line,
             sizeof(line),
-            "Hum %.0f%% Dew %.1fC",
+            "Hum %.0f%% Dew %.1f%c",
             (double)weather->humidity,
-            (double)weather_dew_point_c(weather->temperature, weather->humidity));
+            (double)weather_display_temp(app, weather_dew_point_c(weather->temperature, weather->humidity)),
+            weather_temp_unit(app));
     } else if(weather->has_humidity) {
         snprintf(line, sizeof(line), "Hum %.0f%% Dew ?", (double)weather->humidity);
     } else {
@@ -4069,6 +4119,7 @@ static bool settings_is_cycleable(MeshtasticApp* app, uint32_t item) {
     case SettingItemRole:
     case SettingItemNodeinfoInterval:
     case SettingItemMessageLimit:
+    case SettingItemTemperatureUnit:
     case SettingItemChannelPreset:
         return true;
     default:
@@ -4157,6 +4208,9 @@ static void settings_get_label(MeshtasticApp* app, uint32_t item, char* out, siz
         break;
     case SettingItemMessageLimit:
         snprintf(out, out_size, "Inbox limit: %s", message_limit_labels[app->message_limit_index]);
+        break;
+    case SettingItemTemperatureUnit:
+        snprintf(out, out_size, "Temp unit: %c", app->weather_fahrenheit ? 'F' : 'C');
         break;
     case SettingItemRegion:
         snprintf(out, out_size, "Region: US");
@@ -4432,6 +4486,12 @@ static void settings_cycle(MeshtasticApp* app, uint32_t item, int8_t dir) {
         settings_save(app);
         if(app->current_view == ViewIdInbox) inbox_redraw(app);
         if(app->current_view == ViewIdDmInbox) dm_inbox_redraw(app);
+        settings_refresh(app, false);
+    } else if(item == SettingItemTemperatureUnit) {
+        UNUSED(dir);
+        app->weather_fahrenheit = !app->weather_fahrenheit;
+        settings_save(app);
+        if(app->current_view == ViewIdWeather) weather_redraw(app);
         settings_refresh(app, false);
     } else if(item == SettingItemChannelPreset) {
         size_t count = sizeof(channel_preset_labels) / sizeof(channel_preset_labels[0]);

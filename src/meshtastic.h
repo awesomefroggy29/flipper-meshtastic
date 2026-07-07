@@ -273,6 +273,7 @@ typedef struct {
     uint8_t role_index;
     uint8_t message_limit_index;
     uint8_t message_limit;
+    bool weather_fahrenheit;
     float current_freq_mhz;
     float current_bw_khz;
     uint8_t current_sf;

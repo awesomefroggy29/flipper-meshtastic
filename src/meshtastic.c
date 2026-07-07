@@ -31,7 +31,7 @@
 #define PACKET_CACHE_TTL_SEC (30 * 60)
 #define SETTINGS_PATH APP_DATA_PATH("meshtastic/settings_v6.bin")
 #define SETTINGS_MAGIC 0x4D534747u
-#define SETTINGS_VERSION 9
+#define SETTINGS_VERSION 10
 #define NODEINFO_BURST_COUNT 0
 #define NODEINFO_BURST_INTERVAL_MS 1000
 #define RADIO_STARTUP_DELAY_MS 1000
@@ -41,7 +41,6 @@
 #define SETTINGS_HOLD_DELAY_MS 400
 #define SETTINGS_HOLD_REPEAT_MS 143
 #define LOG_BROWSER_MAX_FILES 12
-#define DEFAULT_RSSI_BUSY_THRESHOLD_DBM -90
 #define DEFAULT_MIN_BACKOFF_MS 250
 #define DEFAULT_MAX_BACKOFF_MS 1500
 #define DEFAULT_MAX_TX_WAIT_MS 5000
@@ -513,6 +512,37 @@ typedef struct {
     uint16_t rebroadcast_max_delay_ms;
     uint8_t weather_fahrenheit;
 } SettingsFileV9;
+
+typedef struct {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t max_hops;
+    uint8_t preset_index;
+    uint8_t freq_slot;
+    uint8_t tx_power_dbm;
+    uint8_t role_index;
+    uint8_t nodeinfo_interval_index;
+    uint8_t channel_preset_index;
+    uint8_t channel_psk_len;
+    char channel_name[16];
+    char self_short_name[5];
+    char self_long_name[37];
+    uint8_t channel_psk[32];
+    uint8_t private_key[32];
+    uint8_t public_key[32];
+    uint8_t message_limit_index;
+    uint8_t politeness_enabled;
+    uint8_t cad_enabled;
+    uint8_t rssi_fallback_enabled;
+    int8_t rssi_busy_threshold_dbm; // Legacy absolute threshold; ignored by v10+.
+    uint16_t min_backoff_ms;
+    uint16_t max_backoff_ms;
+    uint16_t max_tx_wait_ms;
+    uint16_t rebroadcast_min_delay_ms;
+    uint16_t rebroadcast_max_delay_ms;
+    uint8_t weather_fahrenheit;
+    uint8_t rssi_busy_margin_db;
+} SettingsFileV10;
 
 // US region (Meshtastic)
 #define REGION_US_FREQ_START_MHZ 902.0f
@@ -1041,8 +1071,12 @@ static void weather_reset(MeshtasticApp* app) {
 
 static void settings_clamp_politeness(MeshtasticApp* app) {
     if(!app) return;
-    if(app->rssi_busy_threshold_dbm < -120 || app->rssi_busy_threshold_dbm > -40) {
-        app->rssi_busy_threshold_dbm = DEFAULT_RSSI_BUSY_THRESHOLD_DBM;
+    if(app->rssi_busy_margin_db < 6 || app->rssi_busy_margin_db > 10) {
+        app->rssi_busy_margin_db = DEFAULT_RSSI_BUSY_MARGIN_DB;
+    }
+    if(app->rssi_noise_floor_dbm < -127 || app->rssi_noise_floor_dbm > 0) {
+        app->rssi_noise_floor_dbm = DEFAULT_RSSI_NOISE_FLOOR_DBM;
+        app->rssi_noise_floor_valid = false;
     }
     if(app->min_backoff_ms < 50) app->min_backoff_ms = 50;
     if(app->max_backoff_ms < app->min_backoff_ms) app->max_backoff_ms = app->min_backoff_ms;
@@ -1076,7 +1110,9 @@ static void settings_defaults(MeshtasticApp* app) {
     app->politeness_enabled = true;
     app->cad_enabled = true;
     app->rssi_fallback_enabled = true;
-    app->rssi_busy_threshold_dbm = DEFAULT_RSSI_BUSY_THRESHOLD_DBM;
+    app->rssi_busy_margin_db = DEFAULT_RSSI_BUSY_MARGIN_DB;
+    app->rssi_noise_floor_dbm = DEFAULT_RSSI_NOISE_FLOOR_DBM;
+    app->rssi_noise_floor_valid = false;
     app->min_backoff_ms = DEFAULT_MIN_BACKOFF_MS;
     app->max_backoff_ms = DEFAULT_MAX_BACKOFF_MS;
     app->max_tx_wait_ms = DEFAULT_MAX_TX_WAIT_MS;
@@ -1097,7 +1133,7 @@ static void settings_save(MeshtasticApp* app) {
     File* file = storage_file_alloc(app->storage);
     if(!file) return;
     if(storage_file_open(file, SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        SettingsFileV9 data = {
+        SettingsFileV10 data = {
             .magic = SETTINGS_MAGIC,
             .version = SETTINGS_VERSION,
             .max_hops = app->max_hops,
@@ -1112,13 +1148,14 @@ static void settings_save(MeshtasticApp* app) {
             .politeness_enabled = app->politeness_enabled ? 1 : 0,
             .cad_enabled = app->cad_enabled ? 1 : 0,
             .rssi_fallback_enabled = app->rssi_fallback_enabled ? 1 : 0,
-            .rssi_busy_threshold_dbm = app->rssi_busy_threshold_dbm,
+            .rssi_busy_threshold_dbm = (int8_t)(app->rssi_noise_floor_dbm + app->rssi_busy_margin_db),
             .min_backoff_ms = app->min_backoff_ms,
             .max_backoff_ms = app->max_backoff_ms,
             .max_tx_wait_ms = app->max_tx_wait_ms,
             .rebroadcast_min_delay_ms = app->rebroadcast_min_delay_ms,
             .rebroadcast_max_delay_ms = app->rebroadcast_max_delay_ms,
             .weather_fahrenheit = app->weather_fahrenheit ? 1 : 0,
+            .rssi_busy_margin_db = app->rssi_busy_margin_db,
         };
         memcpy(data.channel_name, app->channel_name, sizeof(data.channel_name));
         memcpy(data.self_short_name, app->self_short_name, sizeof(data.self_short_name));
@@ -1143,7 +1180,7 @@ static void settings_load(MeshtasticApp* app) {
     FURI_LOG_I("Main", "Settings load: file alloc");
     if(storage_file_open(file, SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         FURI_LOG_I("Main", "Settings load: file open");
-        SettingsFileV9 data = {0};
+        SettingsFileV10 data = {0};
         size_t read = storage_file_read(file, &data, sizeof(data));
         FURI_LOG_I("Main", "Settings load: read %u", (unsigned)read);
         if(read >= sizeof(SettingsFileV2) && data.magic == SETTINGS_MAGIC) {
@@ -1223,18 +1260,25 @@ static void settings_load(MeshtasticApp* app) {
                         app->politeness_enabled = v8->politeness_enabled ? true : false;
                         app->cad_enabled = v8->cad_enabled ? true : false;
                         app->rssi_fallback_enabled = v8->rssi_fallback_enabled ? true : false;
-                        app->rssi_busy_threshold_dbm = v8->rssi_busy_threshold_dbm;
                         app->min_backoff_ms = v8->min_backoff_ms;
                         app->max_backoff_ms = v8->max_backoff_ms;
                         app->max_tx_wait_ms = v8->max_tx_wait_ms;
                         app->rebroadcast_min_delay_ms = v8->rebroadcast_min_delay_ms;
                         app->rebroadcast_max_delay_ms = v8->rebroadcast_max_delay_ms;
+                        app->rssi_busy_margin_db = DEFAULT_RSSI_BUSY_MARGIN_DB;
                         settings_clamp_politeness(app);
                         if(data.version >= 9 && read >= sizeof(SettingsFileV9)) {
                             SettingsFileV9* v9 = (SettingsFileV9*)&data;
                             app->weather_fahrenheit = v9->weather_fahrenheit ? true : false;
                         } else {
                             app->weather_fahrenheit = false;
+                            settings_dirty = true;
+                        }
+                        if(data.version >= 10 && read >= sizeof(SettingsFileV10)) {
+                            SettingsFileV10* v10 = (SettingsFileV10*)&data;
+                            app->rssi_busy_margin_db = v10->rssi_busy_margin_db;
+                            settings_clamp_politeness(app);
+                        } else {
                             settings_dirty = true;
                         }
                     } else {
@@ -4156,7 +4200,7 @@ static void settings_get_label(MeshtasticApp* app, uint32_t item, char* out, siz
             snprintf(out, out_size, "RSSI fallback: %s", settings_bool_label(app->rssi_fallback_enabled));
             break;
         case PoliteItemRssiThreshold:
-            snprintf(out, out_size, "Busy RSSI: %d dBm", app->rssi_busy_threshold_dbm);
+            snprintf(out, out_size, "RSSI busy: +%u dB", (unsigned)app->rssi_busy_margin_db);
             break;
         case PoliteItemMinBackoff:
             snprintf(out, out_size, "Min backoff: %u ms", (unsigned)app->min_backoff_ms);
@@ -4383,11 +4427,11 @@ static void settings_cycle_politeness(MeshtasticApp* app, uint32_t item, int8_t 
         break;
     case PoliteItemRssiThreshold:
         if(dir > 0) {
-            app->rssi_busy_threshold_dbm =
-                (app->rssi_busy_threshold_dbm >= -40) ? -120 : (int8_t)(app->rssi_busy_threshold_dbm + 5);
+            app->rssi_busy_margin_db =
+                (app->rssi_busy_margin_db >= 10) ? 6 : (uint8_t)(app->rssi_busy_margin_db + 1);
         } else {
-            app->rssi_busy_threshold_dbm =
-                (app->rssi_busy_threshold_dbm <= -120) ? -40 : (int8_t)(app->rssi_busy_threshold_dbm - 5);
+            app->rssi_busy_margin_db =
+                (app->rssi_busy_margin_db <= 6) ? 10 : (uint8_t)(app->rssi_busy_margin_db - 1);
         }
         break;
     case PoliteItemMinBackoff:
@@ -4852,6 +4896,11 @@ static void meshtastic_channel_name_done(void* ctx) {
 static void meshtastic_busy_dialog_done(DialogExResult result, void* ctx) {
     MeshtasticApp* app = ctx;
     if(!app) return;
+    if(app->contacts_warning_dialog) {
+        app->contacts_warning_dialog = false;
+        meshtastic_switch_view(app, result == DialogExResultCenter ? ViewIdContacts : ViewIdMenu);
+        return;
+    }
     if(result == DialogExResultCenter) {
         meshtastic_switch_view(app, app->busy_dialog_is_dm ? ViewIdDmInbox : ViewIdInbox);
     }
@@ -4860,6 +4909,7 @@ static void meshtastic_busy_dialog_done(DialogExResult result, void* ctx) {
 static void meshtastic_show_channel_busy_dialog(MeshtasticApp* app, bool is_dm) {
     if(!app || !app->busy_dialog) return;
     app->busy_dialog_is_dm = is_dm;
+    app->contacts_warning_dialog = false;
     dialog_ex_reset(app->busy_dialog);
     dialog_ex_set_header(app->busy_dialog, "Channel busy", 64, 10, AlignCenter, AlignTop);
     dialog_ex_set_text(
@@ -4875,6 +4925,24 @@ static void meshtastic_show_channel_busy_dialog(MeshtasticApp* app, bool is_dm) 
     meshtastic_switch_view(app, ViewIdPopup);
 }
 
+static void meshtastic_show_contacts_warning(MeshtasticApp* app) {
+    if(!app || !app->busy_dialog) return;
+    app->contacts_warning_dialog = true;
+    dialog_ex_reset(app->busy_dialog);
+    dialog_ex_set_text(
+        app->busy_dialog,
+        "Direct Messaging\nis currently not\nfunctioning.\nPlaceholder only.",
+        64,
+        30,
+        AlignCenter,
+        AlignCenter);
+    dialog_ex_set_left_button_text(app->busy_dialog, "Back");
+    dialog_ex_set_center_button_text(app->busy_dialog, "OK");
+    dialog_ex_set_context(app->busy_dialog, app);
+    dialog_ex_set_result_callback(app->busy_dialog, meshtastic_busy_dialog_done);
+    meshtastic_switch_view(app, ViewIdPopup);
+}
+
 static bool meshtastic_navigation(void* ctx) {
     MeshtasticApp* app = ctx;
     if(!app) return false;
@@ -4883,7 +4951,12 @@ static bool meshtastic_navigation(void* ctx) {
     } else if(app->current_view == ViewIdSend && app->settings_keyboard_active) {
         meshtastic_switch_view(app, ViewIdSettings);
     } else if(app->current_view == ViewIdPopup) {
-        meshtastic_switch_view(app, app->busy_dialog_is_dm ? ViewIdDmInbox : ViewIdInbox);
+        if(app->contacts_warning_dialog) {
+            app->contacts_warning_dialog = false;
+            meshtastic_switch_view(app, ViewIdMenu);
+        } else {
+            meshtastic_switch_view(app, app->busy_dialog_is_dm ? ViewIdDmInbox : ViewIdInbox);
+        }
     } else if(app->current_view == ViewIdLogs) {
         meshtastic_switch_view(app, ViewIdMenu);
     } else if(app->current_view == ViewIdLogFiles) {
@@ -4922,7 +4995,7 @@ static void meshtastic_menu_callback(void* ctx, uint32_t index) {
     } else if(index == MenuItemNodes) {
         meshtastic_switch_view(app, ViewIdNodes);
     } else if(index == MenuItemContacts) {
-        meshtastic_switch_view(app, ViewIdContacts);
+        meshtastic_show_contacts_warning(app);
     } else if(index == MenuItemWeather) {
         meshtastic_switch_view(app, ViewIdWeather);
     } else if(index == MenuItemSettings) {
@@ -5244,6 +5317,8 @@ static void meshtastic_radio_step(MeshtasticApp* app) {
             }
         }
     }
+
+    rfm95w_update_noise_floor_ema(app);
 }
 
 static void meshtastic_tick(void* ctx) {
@@ -5415,6 +5490,7 @@ int32_t meshtastic_app_entry(void* p) {
     } else {
         FURI_LOG_I("Main", "Radio Ready");
         app->state = AppStateIdle;
+        rfm95w_update_noise_floor_ema(app);
     }
 
     FURI_LOG_I("Main", "Radio init stage done");

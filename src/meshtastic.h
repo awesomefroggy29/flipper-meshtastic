@@ -126,6 +126,8 @@ typedef struct {
 #define MAX_WEATHER_NODES 12
 #define MAX_PACKET_CACHE 64
 #define MAX_PENDING_RELAYS 4
+#define DEFAULT_RSSI_NOISE_FLOOR_DBM -100
+#define DEFAULT_RSSI_BUSY_MARGIN_DB 6
 
 typedef struct {
     uint32_t node_id;
@@ -251,6 +253,7 @@ typedef struct {
     int8_t pending_tx_msg_index;
     bool last_tx_busy_timeout;
     bool busy_dialog_is_dm;
+    bool contacts_warning_dialog;
     bool sending_dm;
     uint32_t dm_target_id;
     char dm_target_short[5];
@@ -290,7 +293,11 @@ typedef struct {
     bool politeness_enabled;
     bool cad_enabled;
     bool rssi_fallback_enabled;
-    int8_t rssi_busy_threshold_dbm;
+    int8_t rssi_noise_floor_dbm;
+    int16_t rssi_noise_floor_ema_x16;
+    uint32_t last_noise_floor_sample_ms;
+    uint8_t rssi_busy_margin_db;
+    bool rssi_noise_floor_valid;
     uint16_t min_backoff_ms;
     uint16_t max_backoff_ms;
     uint16_t max_tx_wait_ms;
@@ -339,6 +346,7 @@ void rfm95w_set_mode_standby(void);
 void rfm95w_set_mode_rx(void);
 bool rfm95w_send_packet(MeshtasticApp* app, uint8_t* data, size_t len);
 int rfm95w_read_packet(MeshtasticApp* app, uint8_t* buffer);
+void rfm95w_update_noise_floor_ema(MeshtasticApp* app);
 void rfm95w_set_dio0_interrupt(MeshtasticApp* app, bool enable);
 bool rfm95w_dio0_status(void);
 void rfm95w_dio0_clear(void);

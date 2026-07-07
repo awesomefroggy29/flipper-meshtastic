@@ -4,6 +4,10 @@
 static int8_t last_rssi = 0;
 static int8_t last_snr = 0;
 
+#define NOISE_FLOOR_SAMPLE_INTERVAL_MS 100
+#define CAD_TIMEOUT_MIN_MS 5
+#define CAD_TIMEOUT_MAX_MS 200
+
 // ============ REGISTER ACCESS ============
 uint8_t read_reg(uint8_t addr) {
     uint8_t val = 0;
@@ -58,6 +62,17 @@ void rfm95w_set_mode_rx(void) {
     write_reg(REG_DIO_MAPPING_1, 0x00); // DIO0 = RxDone
     write_reg(REG_OPMODE, MODE_LORA | MODE_RXCONTINUOUS);
     furi_delay_ms(5);
+}
+
+static void rfm95w_set_mode_standby_fast(void) {
+    write_reg(REG_OPMODE, MODE_LORA | MODE_STDBY);
+    furi_delay_ms(1);
+}
+
+static void rfm95w_set_mode_rx_fast(void) {
+    write_reg(REG_DIO_MAPPING_1, 0x00); // DIO0 = RxDone
+    write_reg(REG_OPMODE, MODE_LORA | MODE_RXCONTINUOUS);
+    furi_delay_ms(1);
 }
 
 static void rfm95w_power_cycle(void) {
@@ -203,10 +218,93 @@ static uint32_t radio_random_between(uint32_t min, uint32_t max) {
     return min + (furi_hal_random_get() % (max - min + 1));
 }
 
+static uint8_t rfm95w_rssi_margin(MeshtasticApp* app) {
+    if(!app || app->rssi_busy_margin_db < 6 || app->rssi_busy_margin_db > 10) return 6;
+    return app->rssi_busy_margin_db;
+}
+
+static int16_t rfm95w_noise_floor(MeshtasticApp* app) {
+    if(!app || !app->rssi_noise_floor_valid) return DEFAULT_RSSI_NOISE_FLOOR_DBM;
+    return app->rssi_noise_floor_dbm;
+}
+
+static int16_t rfm95w_busy_rssi_threshold(MeshtasticApp* app) {
+    return rfm95w_noise_floor(app) + (int16_t)rfm95w_rssi_margin(app);
+}
+
+static int16_t rfm95w_round_ema_x16(int16_t ema_x16) {
+    if(ema_x16 >= 0) return (int16_t)((ema_x16 + 8) / 16);
+    return (int16_t)((ema_x16 - 8) / 16);
+}
+
+static uint32_t rfm95w_cad_timeout_ms(MeshtasticApp* app) {
+    uint8_t sf = app ? app->current_sf : 11;
+    float bw_khz = app ? app->current_bw_khz : 250.0f;
+    if(sf < 6 || sf > 12) sf = 11;
+    if(bw_khz <= 0.0f) bw_khz = 250.0f;
+
+    // SX127x CAD time scales with LoRa symbol time. Wait about four symbols
+    // plus a small guard so slow presets do not false-timeout.
+    float symbol_ms = (float)(1UL << sf) / bw_khz;
+    uint32_t timeout_ms = (uint32_t)((symbol_ms * 4.0f) + 5.0f);
+    if(timeout_ms < CAD_TIMEOUT_MIN_MS) timeout_ms = CAD_TIMEOUT_MIN_MS;
+    if(timeout_ms > CAD_TIMEOUT_MAX_MS) timeout_ms = CAD_TIMEOUT_MAX_MS;
+    return timeout_ms;
+}
+
+void rfm95w_update_noise_floor_ema(MeshtasticApp* app) {
+    if(!app) return;
+    if(app->state != AppStateIdle || app->packet_available || app->pending_tx || app->pending_pos) return;
+
+    uint32_t now = furi_get_tick();
+    if(app->last_noise_floor_sample_ms != 0 &&
+       now - app->last_noise_floor_sample_ms < NOISE_FLOOR_SAMPLE_INTERVAL_MS) {
+        return;
+    }
+
+    uint8_t opmode = read_reg(REG_OPMODE);
+    if((opmode & 0x07) != MODE_RXCONTINUOUS) return;
+
+    uint8_t irq = read_reg(REG_IRQ_FLAGS);
+    if(irq & (IRQ_VALID_HEADER | IRQ_RX_DONE | IRQ_PAYLOAD_CRC_ERROR | IRQ_RX_TIMEOUT)) return;
+
+    int16_t rssi = rfm95w_get_current_rssi();
+    if(rssi < -127) rssi = -127;
+    if(rssi > 0) rssi = 0;
+    app->last_noise_floor_sample_ms = now;
+
+    int16_t sample_x16 = (int16_t)(rssi * 16);
+    if(!app->rssi_noise_floor_valid) {
+        app->rssi_noise_floor_ema_x16 = sample_x16;
+        app->rssi_noise_floor_valid = true;
+        app->rssi_noise_floor_dbm = (int8_t)rssi;
+        FURI_LOG_I(
+            "Radio",
+            "Noise floor EMA init: %d dBm, busy threshold %d dBm",
+            app->rssi_noise_floor_dbm,
+            rfm95w_busy_rssi_threshold(app));
+        meshtastic_log_event(
+            app,
+            LogCategoryPoliteness,
+            "noise floor EMA init=%d margin=+%u threshold=%d",
+            app->rssi_noise_floor_dbm,
+            (unsigned)rfm95w_rssi_margin(app),
+            rfm95w_busy_rssi_threshold(app));
+    } else {
+        // EMA alpha = 1/8. This tracks slow floor changes but ignores short packets.
+        app->rssi_noise_floor_ema_x16 =
+            (int16_t)(app->rssi_noise_floor_ema_x16 + ((sample_x16 - app->rssi_noise_floor_ema_x16) / 8));
+        int16_t rounded = rfm95w_round_ema_x16(app->rssi_noise_floor_ema_x16);
+        if(rounded < -127) rounded = -127;
+        if(rounded > 0) rounded = 0;
+        app->rssi_noise_floor_dbm = (int8_t)rounded;
+    }
+}
+
 static bool rfm95w_send_packet_now(uint8_t* data, size_t len) {
     if(!data || len == 0 || len > 255) return false;
 
-    rfm95w_set_mode_standby();
+    rfm95w_set_mode_standby_fast();
     write_reg(REG_IRQ_FLAGS, 0xFF);
 
     write_reg(REG_FIFO_ADDR_PTR, 0x00);
@@ -236,20 +334,21 @@ static bool rfm95w_send_packet_now(uint8_t* data, size_t len) {
     return false;
 }
 
-static bool rfm95w_channel_busy_cad(bool* valid) {
+static bool rfm95w_channel_busy_cad(MeshtasticApp* app, bool* valid) {
     if(valid) *valid = false;
 
-    rfm95w_set_mode_standby();
+    rfm95w_set_mode_standby_fast();
     write_reg(REG_IRQ_FLAGS, 0xFF);
     write_reg(REG_OPMODE, MODE_LORA | MODE_CAD);
 
+    uint32_t cad_timeout_ms = rfm95w_cad_timeout_ms(app);
     uint32_t start = furi_get_tick();
-    while(furi_get_tick() - start < 250) {
+    while(furi_get_tick() - start < cad_timeout_ms) {
         uint8_t irq = read_reg(REG_IRQ_FLAGS);
         if(irq & IRQ_CAD_DONE) {
             bool busy = (irq & IRQ_CAD_DETECTED) != 0;
             write_reg(REG_IRQ_FLAGS, IRQ_CAD_DONE | IRQ_CAD_DETECTED);
-            rfm95w_set_mode_rx();
+            rfm95w_set_mode_rx_fast();
             if(valid) *valid = true;
             if(busy) {
                 FURI_LOG_I("Radio", "Channel busy: CAD detected LoRa activity");
@@ -259,10 +358,10 @@ static bool rfm95w_channel_busy_cad(bool* valid) {
         furi_delay_ms(1);
     }
 
-    FURI_LOG_W("Radio", "CAD timeout, falling back if enabled");
+    FURI_LOG_W("Radio", "CAD timeout after %lums, treating channel busy", (unsigned long)cad_timeout_ms);
     write_reg(REG_IRQ_FLAGS, IRQ_CAD_DONE | IRQ_CAD_DETECTED);
-    rfm95w_set_mode_rx();
-    return false;
+    rfm95w_set_mode_rx_fast();
+    return true;
 }
 
 static bool rfm95w_channel_busy(MeshtasticApp* app) {
@@ -270,32 +369,65 @@ static bool rfm95w_channel_busy(MeshtasticApp* app) {
 
     if(app->cad_enabled) {
         bool valid = false;
-        bool busy = rfm95w_channel_busy_cad(&valid);
+        bool busy = rfm95w_channel_busy_cad(app, &valid);
         if(valid) {
             if(busy) {
                 meshtastic_log_event(app, LogCategoryPoliteness, "channel busy CAD detected");
+                return true;
             }
-            return busy;
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "CAD clear timeout_ms=%lu; checking RSSI floor=%d margin=+%u threshold=%d",
+                (unsigned long)rfm95w_cad_timeout_ms(app),
+                rfm95w_noise_floor(app),
+                (unsigned)rfm95w_rssi_margin(app),
+                rfm95w_busy_rssi_threshold(app));
+        } else {
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "channel busy CAD timeout_ms=%lu",
+                (unsigned long)rfm95w_cad_timeout_ms(app));
+            return true;
         }
+    } else if(app->rssi_fallback_enabled) {
+        meshtastic_log_event(
+            app,
+            LogCategoryPoliteness,
+            "CAD disabled; checking RSSI floor=%d margin=+%u threshold=%d",
+            rfm95w_noise_floor(app),
+            (unsigned)rfm95w_rssi_margin(app),
+            rfm95w_busy_rssi_threshold(app));
     }
 
-    if(app->rssi_fallback_enabled) {
-        rfm95w_set_mode_rx();
-        furi_delay_ms(2);
+    if(app->cad_enabled || app->rssi_fallback_enabled) {
         int16_t rssi = rfm95w_get_current_rssi();
-        bool busy = rssi >= app->rssi_busy_threshold_dbm;
+        int16_t threshold = rfm95w_busy_rssi_threshold(app);
+        bool busy = rssi >= threshold;
         if(busy) {
             FURI_LOG_I(
                 "Radio",
                 "Channel busy: RSSI %d dBm >= %d dBm",
                 rssi,
-                app->rssi_busy_threshold_dbm);
+                threshold);
             meshtastic_log_event(
                 app,
                 LogCategoryPoliteness,
-                "channel busy RSSI=%d threshold=%d",
+                "channel busy RSSI=%d floor=%d margin=+%u threshold=%d",
                 rssi,
-                app->rssi_busy_threshold_dbm);
+                rfm95w_noise_floor(app),
+                (unsigned)rfm95w_rssi_margin(app),
+                threshold);
+        } else {
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "RSSI clear RSSI=%d floor=%d margin=+%u threshold=%d",
+                rssi,
+                rfm95w_noise_floor(app),
+                (unsigned)rfm95w_rssi_margin(app),
+                threshold);
         }
         return busy;
     }

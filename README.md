@@ -1,7 +1,7 @@
 # flipper-meshtastic
 An app for the flipper zero that works with the rfm95w from Adafruit to create a functional node for meshtastic
 
-<h2>This app is specifically designed for people IN THE US. If you are not in the US, then it could be illegal. check online if 915mhz LoRa radio/meshtastic on 915mhz is legal.</h2>
+<h2>This app is specifically designed for people IN THE US. If you are not in the US, then it could be illegal. check online if 915mhz LoRa radio/meshtastic is legal in your area.</h2>
 <br>
 <br>
 

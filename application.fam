@@ -4,7 +4,7 @@ App(
     apptype=FlipperAppType.EXTERNAL,
     entry_point="meshtastic_app_entry",
     requires=["gui"],
-    stack_size=8192,
+    stack_size=12288,
     fap_category="Meshtastic",
     fap_icon="icon.png",
     sources=[

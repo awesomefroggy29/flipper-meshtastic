@@ -216,6 +216,108 @@ static bool parse_routing_error(const uint8_t* data, size_t len, uint32_t* out_e
     return found;
 }
 
+static bool skip_proto_value(const uint8_t* data, size_t len, size_t* off, uint32_t wire) {
+    if(wire == 0) {
+        uint64_t v = 0;
+        return read_varint(data, len, off, &v);
+    } else if(wire == 2) {
+        const uint8_t* tmp = NULL;
+        size_t tmp_len = 0;
+        return read_length_delimited(data, len, off, &tmp, &tmp_len);
+    } else if(wire == 5) {
+        uint32_t v = 0;
+        return read_fixed32(data, len, off, &v);
+    } else if(wire == 1) {
+        if(*off + 8 > len) return false;
+        *off += 8;
+        return true;
+    }
+    return false;
+}
+
+static float fixed32_to_float(uint32_t raw) {
+    float value = 0.0f;
+    memcpy(&value, &raw, sizeof(value));
+    return value;
+}
+
+static bool parse_environment_metrics(const uint8_t* data, size_t len, WeatherInfo* out) {
+    if(!data || !out) return false;
+    size_t off = 0;
+    bool found = false;
+    while(off < len) {
+        uint64_t key = 0;
+        if(!read_varint(data, len, &off, &key)) return found;
+        uint32_t field = (uint32_t)(key >> 3);
+        uint32_t wire = (uint32_t)(key & 0x07);
+        uint32_t raw = 0;
+        uint64_t v = 0;
+
+        switch(field) {
+        case 1: // temperature, C
+            if(wire != 5 || !read_fixed32(data, len, &off, &raw)) return found;
+            out->temperature = fixed32_to_float(raw);
+            out->has_temperature = true;
+            found = true;
+            break;
+        case 2: // relative_humidity, %
+            if(wire != 5 || !read_fixed32(data, len, &off, &raw)) return found;
+            out->humidity = fixed32_to_float(raw);
+            out->has_humidity = true;
+            found = true;
+            break;
+        case 3: // barometric_pressure, hPa
+            if(wire != 5 || !read_fixed32(data, len, &off, &raw)) return found;
+            out->pressure = fixed32_to_float(raw);
+            out->has_pressure = true;
+            found = true;
+            break;
+        case 13: // wind_direction, degrees
+            if(wire != 0 || !read_varint(data, len, &off, &v)) return found;
+            out->wind_direction = (uint16_t)(v % 360);
+            out->has_wind_direction = true;
+            found = true;
+            break;
+        case 14: // wind_speed, m/s
+            if(wire != 5 || !read_fixed32(data, len, &off, &raw)) return found;
+            out->wind_speed = fixed32_to_float(raw);
+            out->has_wind_speed = true;
+            found = true;
+            break;
+        case 16: // wind_gust, m/s
+            if(wire != 5 || !read_fixed32(data, len, &off, &raw)) return found;
+            out->wind_gust = fixed32_to_float(raw);
+            out->has_wind_gust = true;
+            found = true;
+            break;
+        default:
+            if(!skip_proto_value(data, len, &off, wire)) return found;
+            break;
+        }
+    }
+    return found;
+}
+
+static bool parse_telemetry_weather(const uint8_t* data, size_t len, WeatherInfo* out) {
+    if(!data || !out) return false;
+    memset(out, 0, sizeof(*out));
+    size_t off = 0;
+    while(off < len) {
+        uint64_t key = 0;
+        if(!read_varint(data, len, &off, &key)) return false;
+        uint32_t field = (uint32_t)(key >> 3);
+        uint32_t wire = (uint32_t)(key & 0x07);
+        if(field == 3 && wire == 2) {
+            const uint8_t* env = NULL;
+            size_t env_len = 0;
+            if(!read_length_delimited(data, len, &off, &env, &env_len)) return false;
+            return parse_environment_metrics(env, env_len, out);
+        }
+        if(!skip_proto_value(data, len, &off, wire)) return false;
+    }
+    return false;
+}
+
 static void parse_user_message(
     const uint8_t* data,
     size_t len,
@@ -375,8 +477,6 @@ static void maybe_relay_packet(
     if(hdr_to == app->self_node_id) return;
     uint8_t hop_limit = hdr_flags & PACKET_FLAGS_HOP_LIMIT_MASK;
     if(hop_limit == 0) return;
-    if(meshtastic_relay_seen(app, hdr_from, hdr_id)) return;
-    meshtastic_relay_mark(app, hdr_from, hdr_id);
 
     if(len < 16 || len > 255) return;
     uint8_t buffer[256];
@@ -389,7 +489,7 @@ static void maybe_relay_packet(
     buffer[14] = 0x00; // next_hop (no preference)
     buffer[15] = (uint8_t)(app->self_node_id & 0xFF); // relay_node
 
-    rfm95w_send_packet(app, buffer, len);
+    meshtastic_queue_relay_packet(app, buffer, len, hdr_from, hdr_id, data[13]);
 }
 
 void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
@@ -428,6 +528,31 @@ void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
             hdr_flags,
             hdr_chash,
             hdr_pad);
+
+        if(app && hdr_chash != app->channel_hash) {
+            bool is_pki_dm = (hdr_chash == 0x00 && hdr_to == app->self_node_id &&
+                              hdr_to != NODENUM_BROADCAST);
+            if(!is_pki_dm) {
+                FURI_LOG_W(
+                    "Proto",
+                    "Dropping packet with channel hash 0x%02X (expected 0x%02X)",
+                    hdr_chash,
+                    app->channel_hash);
+                return;
+            }
+        }
+        if(app && meshtastic_packet_seen(app, hdr_from, hdr_id)) {
+            meshtastic_cancel_relay_packet(app, data, len, hdr_from, hdr_id, hdr_chash);
+            FURI_LOG_I(
+                "Proto",
+                "Ignoring duplicate packet from=0x%08lX id=0x%08lX",
+                (unsigned long)hdr_from,
+                (unsigned long)hdr_id);
+            return;
+        }
+        if(app) {
+            meshtastic_packet_mark(app, hdr_from, hdr_id);
+        }
 
         maybe_relay_packet(app, data, len, hdr_to, hdr_from, hdr_id, hdr_flags);
 
@@ -705,6 +830,16 @@ void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
                                 uid,
                                 short_name,
                                 (unsigned)pub_len);
+                            meshtastic_log_event(
+                                app,
+                                LogCategoryNodeInfo,
+                                "rx from=0x%08lX user=%s long=%s short=%s role=%u pub=%u",
+                                (unsigned long)hdr_from,
+                                uid,
+                                long_name,
+                                short_name,
+                                (unsigned)role,
+                                (unsigned)pub_len);
                             meshtastic_update_node_info(
                                 app,
                                 hdr_from,
@@ -737,6 +872,38 @@ void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
                                 }
                             }
                         }
+                    } else if(data_msg.portnum == PORTNUM_TELEMETRY_APP) {
+                        if(app && hdr_from != app->self_node_id) {
+                            WeatherInfo weather = {0};
+                            if(parse_telemetry_weather(data_msg.payload, data_msg.payload_len, &weather)) {
+                                FURI_LOG_I(
+                                    "Proto",
+                                    "Weather telemetry from=0x%08lX",
+                                    (unsigned long)hdr_from);
+                                meshtastic_log_event(
+                                    app,
+                                    LogCategoryTelemetry,
+                                    "weather rx from=0x%08lX temp=%s hum=%s pressure=%s wind=%s",
+                                    (unsigned long)hdr_from,
+                                    weather.has_temperature ? "yes" : "no",
+                                    weather.has_humidity ? "yes" : "no",
+                                    weather.has_pressure ? "yes" : "no",
+                                    weather.has_wind_speed ? "yes" : "no");
+                                meshtastic_store_weather(app, hdr_from, &weather);
+                            } else {
+                                FURI_LOG_I(
+                                    "Proto",
+                                    "Telemetry port=67 payload_len=%u",
+                                    (unsigned)data_msg.payload_len);
+                                meshtastic_log_event(
+                                    app,
+                                    LogCategoryTelemetry,
+                                    "rx from=0x%08lX payload_len=%u",
+                                    (unsigned long)hdr_from,
+                                    (unsigned)data_msg.payload_len);
+                            }
+                        }
+                        return;
                     } else if(data_msg.portnum == PORTNUM_TEXT_MESSAGE_APP) {
                         char text[128];
                         size_t copy_len = data_msg.payload_len;
@@ -913,6 +1080,16 @@ void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
                     uid,
                     short_name,
                     (unsigned)pub_len);
+                meshtastic_log_event(
+                    app,
+                    LogCategoryNodeInfo,
+                    "rx from=0x%08lX user=%s long=%s short=%s role=%u pub=%u",
+                    (unsigned long)pkt.from,
+                    uid,
+                    long_name,
+                    short_name,
+                    (unsigned)role,
+                    (unsigned)pub_len);
                 meshtastic_update_node_info(
                     app,
                     pkt.from,
@@ -922,6 +1099,37 @@ void process_received_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
                     role,
                     (pub_len == sizeof(pub_key)) ? pub_key : NULL,
                     pub_len);
+            }
+        } else if(data_msg.portnum == PORTNUM_TELEMETRY_APP) {
+            if(app && pkt.from != app->self_node_id) {
+                WeatherInfo weather = {0};
+                if(parse_telemetry_weather(data_msg.payload, data_msg.payload_len, &weather)) {
+                    FURI_LOG_I(
+                        "Proto",
+                        "Weather telemetry from=0x%08lX",
+                        (unsigned long)pkt.from);
+                    meshtastic_log_event(
+                        app,
+                        LogCategoryTelemetry,
+                        "weather rx from=0x%08lX temp=%s hum=%s pressure=%s wind=%s",
+                        (unsigned long)pkt.from,
+                        weather.has_temperature ? "yes" : "no",
+                        weather.has_humidity ? "yes" : "no",
+                        weather.has_pressure ? "yes" : "no",
+                        weather.has_wind_speed ? "yes" : "no");
+                    meshtastic_store_weather(app, pkt.from, &weather);
+                } else {
+                    FURI_LOG_I(
+                        "Proto",
+                        "Telemetry port=67 payload_len=%u",
+                        (unsigned)data_msg.payload_len);
+                    meshtastic_log_event(
+                        app,
+                        LogCategoryTelemetry,
+                        "rx from=0x%08lX payload_len=%u",
+                        (unsigned long)pkt.from,
+                        (unsigned)data_msg.payload_len);
+                }
             }
         } else if(data_msg.portnum == PORTNUM_TEXT_MESSAGE_APP) {
             char text[128];

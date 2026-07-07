@@ -5,7 +5,9 @@
 #include <gui/elements.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
+#include <gui/modules/dialog_ex.h>
 #include <gui/modules/popup.h>
+#include <gui/modules/text_box.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
 #include <stdbool.h>
@@ -15,9 +17,9 @@ typedef struct ViewDispatcher ViewDispatcher;
 typedef struct Submenu Submenu;
 typedef struct TextInput TextInput;
 typedef struct View View;
-typedef struct VariableItemList VariableItemList;
-typedef struct VariableItem VariableItem;
 typedef struct Popup Popup;
+typedef struct DialogEx DialogEx;
+typedef struct TextBox TextBox;
 
 // ============ HARDWARE PINS (hardware SPI external handle) ============
 // External bus fixed pins: MOSI=A7(2), MISO=A6(3), SCK=B3(5), CS=A4(4)
@@ -65,6 +67,7 @@ typedef struct Popup Popup;
 #define MODE_STDBY 0x01
 #define MODE_TX 0x03
 #define MODE_RXCONTINUOUS 0x05
+#define MODE_CAD 0x07
 
 // ============ IRQ FLAGS ============
 #define IRQ_RX_TIMEOUT 0x80
@@ -72,6 +75,8 @@ typedef struct Popup Popup;
 #define IRQ_PAYLOAD_CRC_ERROR 0x20
 #define IRQ_VALID_HEADER 0x10
 #define IRQ_TX_DONE 0x08
+#define IRQ_CAD_DONE 0x04
+#define IRQ_CAD_DETECTED 0x01
 
 // ============ PACKET HEADER FLAGS ============
 #define PACKET_FLAGS_HOP_LIMIT_MASK 0x07
@@ -97,11 +102,13 @@ typedef enum {
 } MeshtasticRole;
 
 // ============ MESSAGE STORAGE ============
+#define MESSAGE_TEXT_MAX 128
+
 typedef struct {
     uint32_t from;
     uint32_t to;
     uint32_t id;
-    uint8_t payload[256];
+    uint8_t payload[MESSAGE_TEXT_MAX];
     uint8_t len;
     int8_t rssi;
     int8_t snr;
@@ -114,8 +121,11 @@ typedef struct {
     uint32_t last_tx_ms;
 } Message;
 
-#define MAX_MESSAGES 20
+#define MAX_MESSAGES 50
 #define MAX_NODES 20
+#define MAX_WEATHER_NODES 12
+#define MAX_PACKET_CACHE 64
+#define MAX_PENDING_RELAYS 4
 
 typedef struct {
     uint32_t node_id;
@@ -132,6 +142,46 @@ typedef struct {
     uint8_t pubkey_mode;
 } NodeInfo;
 
+typedef struct {
+    uint32_t node_id;
+    uint32_t last_heard;
+    uint8_t valid;
+    bool has_temperature;
+    float temperature;
+    bool has_humidity;
+    float humidity;
+    bool has_pressure;
+    float pressure;
+    bool has_wind_direction;
+    uint16_t wind_direction;
+    bool has_wind_speed;
+    float wind_speed;
+    bool has_wind_gust;
+    float wind_gust;
+} WeatherInfo;
+
+typedef struct {
+    uint8_t data[256];
+    uint32_t from;
+    uint32_t id;
+    uint32_t payload_hash;
+    uint32_t due_ms;
+    uint32_t queued_ms;
+    uint8_t len;
+    uint8_t channel;
+    bool active;
+} PendingRelayPacket;
+
+typedef enum {
+    LogCategoryRx,
+    LogCategoryTx,
+    LogCategoryRebroadcast,
+    LogCategoryPoliteness,
+    LogCategoryNodeInfo,
+    LogCategoryTelemetry,
+    LogCategoryCount,
+} MeshtasticLogCategory;
+
 // ============ MAIN APP CONTEXT ============
 typedef struct {
     Gui* gui;
@@ -143,29 +193,17 @@ typedef struct {
     Submenu* submenu;
     Submenu* nodes_menu;
     Submenu* contacts_menu;
+    Submenu* logs_menu;
+    Submenu* log_files_menu;
     TextInput* text_input;
+    TextBox* log_text_box;
+    DialogEx* busy_dialog;
     View* inbox_view;
     View* dm_inbox_view;
     View* node_detail_view;
-    View* error_view;
+    View* weather_view;
+    View* settings_view;
     Popup* popup;
-    VariableItemList* settings_list;
-    VariableItem* settings_max_hops;
-    VariableItem* settings_freq_slot;
-    VariableItem* settings_preset;
-    VariableItem* settings_tx_power;
-    VariableItem* settings_role;
-    VariableItem* settings_nodeinfo_interval;
-    VariableItem* settings_region;
-    VariableItem* settings_short_name;
-    VariableItem* settings_long_name;
-    VariableItem* settings_channel_name;
-    VariableItem* settings_clear;
-    VariableItem* settings_clear_nodes;
-    VariableItem* settings_reset_keys;
-    VariableItem* settings_channel_preset;
-    VariableItem* settings_channel_custom;
-    VariableItem* settings_reset;
 
     AppState state;
     bool running;
@@ -180,6 +218,14 @@ typedef struct {
     NodeInfo nodes[MAX_NODES];
     uint8_t node_count;
     uint8_t selected_node_index;
+
+    WeatherInfo weather[MAX_WEATHER_NODES];
+    uint8_t weather_count;
+    uint8_t weather_scroll;
+    uint8_t selected_log_category;
+    uint8_t log_file_count;
+    char log_file_names[12][40];
+    char log_text_buffer[1536];
 
     uint32_t packets_sent;
     uint32_t packets_received;
@@ -203,6 +249,8 @@ typedef struct {
     uint32_t pending_tx_id;
     uint32_t pending_tx_to;
     int8_t pending_tx_msg_index;
+    bool last_tx_busy_timeout;
+    bool busy_dialog_is_dm;
     bool sending_dm;
     uint32_t dm_target_id;
     char dm_target_short[5];
@@ -223,6 +271,8 @@ typedef struct {
     uint8_t freq_slot;
     uint8_t tx_power_dbm;
     uint8_t role_index;
+    uint8_t message_limit_index;
+    uint8_t message_limit;
     float current_freq_mhz;
     float current_bw_khz;
     uint8_t current_sf;
@@ -236,19 +286,43 @@ typedef struct {
     char channel_name_input[16];
     char short_name_input[5];
     char long_name_input[37];
+    bool politeness_enabled;
+    bool cad_enabled;
+    bool rssi_fallback_enabled;
+    int8_t rssi_busy_threshold_dbm;
+    uint16_t min_backoff_ms;
+    uint16_t max_backoff_ms;
+    uint16_t max_tx_wait_ms;
+    uint16_t rebroadcast_min_delay_ms;
+    uint16_t rebroadcast_max_delay_ms;
+    bool settings_refreshing;
+    uint8_t settings_selected;
+    uint8_t settings_scroll;
+    bool settings_advanced;
+    bool settings_log_clear;
+    bool settings_keyboard_active;
+    bool settings_hold_active;
+    uint8_t settings_hold_key;
+    uint32_t settings_hold_start_ms;
+    uint32_t settings_hold_last_step_ms;
 
     // For UI
     uint8_t scroll_position;
     uint8_t total_lines;
-    uint8_t error_scroll;
 
     uint32_t last_rssi_log;
 
-    // Relay de-dup cache
-    uint32_t relay_from[16];
-    uint32_t relay_id[16];
-    uint8_t relay_count;
-    uint8_t relay_index;
+    // Recently seen packet IDs are persisted to suppress duplicate relays and UI updates.
+    uint32_t packet_cache_from[MAX_PACKET_CACHE];
+    uint32_t packet_cache_id[MAX_PACKET_CACHE];
+    uint32_t packet_cache_seen_at[MAX_PACKET_CACHE];
+    uint8_t packet_cache_count;
+    uint8_t packet_cache_index;
+    bool packet_cache_loaded;
+    bool packet_cache_dirty;
+    uint32_t last_packet_cache_save_ms;
+    uint32_t radio_ready_ms;
+    PendingRelayPacket pending_relays[MAX_PENDING_RELAYS];
 } MeshtasticApp;
 
 // ============ FUNCTION PROTOTYPES ============
@@ -295,8 +369,24 @@ size_t meshtastic_sanitize_bytes(char* out, size_t out_cap, const uint8_t* in, s
 bool meshtastic_send_ack(MeshtasticApp* app, uint32_t to, uint32_t request_id);
 bool meshtastic_send_nodeinfo(MeshtasticApp* app, uint32_t to, bool want_response);
 void meshtastic_mark_ack(MeshtasticApp* app, uint32_t request_id, bool ok, uint32_t ack_from);
-bool meshtastic_relay_seen(MeshtasticApp* app, uint32_t from, uint32_t id);
-void meshtastic_relay_mark(MeshtasticApp* app, uint32_t from, uint32_t id);
+bool meshtastic_packet_seen(MeshtasticApp* app, uint32_t from, uint32_t id);
+void meshtastic_packet_mark(MeshtasticApp* app, uint32_t from, uint32_t id);
+void meshtastic_queue_relay_packet(
+    MeshtasticApp* app,
+    const uint8_t* packet,
+    size_t len,
+    uint32_t from,
+    uint32_t id,
+    uint8_t channel);
+void meshtastic_cancel_relay_packet(
+    MeshtasticApp* app,
+    const uint8_t* packet,
+    size_t len,
+    uint32_t from,
+    uint32_t id,
+    uint8_t channel);
+void meshtastic_process_relay_queue(MeshtasticApp* app);
+void meshtastic_log_event(MeshtasticApp* app, MeshtasticLogCategory category, const char* format, ...);
 void meshtastic_update_node_info(
     MeshtasticApp* app,
     uint32_t node_id,
@@ -307,5 +397,6 @@ void meshtastic_update_node_info(
     const uint8_t* public_key,
     size_t public_key_len);
 void meshtastic_touch_node(MeshtasticApp* app, uint32_t node_id, uint8_t hops_used);
+void meshtastic_store_weather(MeshtasticApp* app, uint32_t node_id, const WeatherInfo* weather);
 bool meshtastic_get_node_public_key(MeshtasticApp* app, uint32_t node_id, uint8_t* out, size_t out_len);
 void meshtastic_set_node_pubkey_mode(MeshtasticApp* app, uint32_t node_id, uint8_t mode);

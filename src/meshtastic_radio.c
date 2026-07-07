@@ -173,7 +173,7 @@ bool rfm95w_apply_config(
     if(tx_power_dbm > 17) {
         write_reg(REG_PA_DAC, 0x87);
         write_reg(REG_OCP, 0x3B); // 150 mA
-        write_reg(REG_PA_CONFIG, 0x80 | 0x0F);
+        write_reg(REG_PA_CONFIG, 0x80 | (tx_power_dbm - 5));
     } else {
         write_reg(REG_PA_DAC, 0x84);
         write_reg(REG_OCP, 0x2B); // 100 mA
@@ -198,10 +198,12 @@ bool rfm95w_apply_config(
     return true;
 }
 
-// ============ SEND PACKET ============
-bool rfm95w_send_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
-    UNUSED(app);
+static uint32_t radio_random_between(uint32_t min, uint32_t max) {
+    if(max <= min) return min;
+    return min + (furi_hal_random_get() % (max - min + 1));
+}
 
+static bool rfm95w_send_packet_now(uint8_t* data, size_t len) {
     if(!data || len == 0 || len > 255) return false;
 
     rfm95w_set_mode_standby();
@@ -232,6 +234,134 @@ bool rfm95w_send_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
     write_reg(REG_IRQ_FLAGS, 0xFF);
     rfm95w_set_mode_rx();
     return false;
+}
+
+static bool rfm95w_channel_busy_cad(bool* valid) {
+    if(valid) *valid = false;
+
+    rfm95w_set_mode_standby();
+    write_reg(REG_IRQ_FLAGS, 0xFF);
+    write_reg(REG_OPMODE, MODE_LORA | MODE_CAD);
+
+    uint32_t start = furi_get_tick();
+    while(furi_get_tick() - start < 250) {
+        uint8_t irq = read_reg(REG_IRQ_FLAGS);
+        if(irq & IRQ_CAD_DONE) {
+            bool busy = (irq & IRQ_CAD_DETECTED) != 0;
+            write_reg(REG_IRQ_FLAGS, IRQ_CAD_DONE | IRQ_CAD_DETECTED);
+            rfm95w_set_mode_rx();
+            if(valid) *valid = true;
+            if(busy) {
+                FURI_LOG_I("Radio", "Channel busy: CAD detected LoRa activity");
+            }
+            return busy;
+        }
+        furi_delay_ms(1);
+    }
+
+    FURI_LOG_W("Radio", "CAD timeout, falling back if enabled");
+    write_reg(REG_IRQ_FLAGS, IRQ_CAD_DONE | IRQ_CAD_DETECTED);
+    rfm95w_set_mode_rx();
+    return false;
+}
+
+static bool rfm95w_channel_busy(MeshtasticApp* app) {
+    if(!app) return false;
+
+    if(app->cad_enabled) {
+        bool valid = false;
+        bool busy = rfm95w_channel_busy_cad(&valid);
+        if(valid) {
+            if(busy) {
+                meshtastic_log_event(app, LogCategoryPoliteness, "channel busy CAD detected");
+            }
+            return busy;
+        }
+    }
+
+    if(app->rssi_fallback_enabled) {
+        rfm95w_set_mode_rx();
+        furi_delay_ms(2);
+        int16_t rssi = rfm95w_get_current_rssi();
+        bool busy = rssi >= app->rssi_busy_threshold_dbm;
+        if(busy) {
+            FURI_LOG_I(
+                "Radio",
+                "Channel busy: RSSI %d dBm >= %d dBm",
+                rssi,
+                app->rssi_busy_threshold_dbm);
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "channel busy RSSI=%d threshold=%d",
+                rssi,
+                app->rssi_busy_threshold_dbm);
+        }
+        return busy;
+    }
+
+    return false;
+}
+
+// ============ SEND PACKET ============
+bool rfm95w_send_packet(MeshtasticApp* app, uint8_t* data, size_t len) {
+    if(!data || len == 0 || len > 255) return false;
+    if(app) app->last_tx_busy_timeout = false;
+    if(!app || !app->politeness_enabled) return rfm95w_send_packet_now(data, len);
+
+    uint32_t min_backoff = app->min_backoff_ms;
+    uint32_t max_backoff = app->max_backoff_ms;
+    uint32_t max_wait = app->max_tx_wait_ms;
+    if(min_backoff == 0) min_backoff = 250;
+    if(max_backoff < min_backoff) max_backoff = min_backoff;
+    if(max_wait == 0) max_wait = 5000;
+
+    uint32_t start = furi_get_tick();
+    while(true) {
+        if(!rfm95w_channel_busy(app)) {
+            FURI_LOG_I(
+                "Radio",
+                "TX allowed after %lums wait",
+                (unsigned long)(furi_get_tick() - start));
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "tx allowed wait_ms=%lu len=%u",
+                (unsigned long)(furi_get_tick() - start),
+                (unsigned)len);
+            return rfm95w_send_packet_now(data, len);
+        }
+
+        uint32_t waited = furi_get_tick() - start;
+        if(waited >= max_wait) {
+            FURI_LOG_W(
+                "Radio",
+                "TX dropped after max wait %lums, len=%u",
+                (unsigned long)waited,
+                (unsigned)len);
+            meshtastic_log_event(
+                app,
+                LogCategoryPoliteness,
+                "tx dropped max_wait_ms=%lu len=%u",
+                (unsigned long)waited,
+                (unsigned)len);
+            app->last_tx_busy_timeout = true;
+            rfm95w_set_mode_rx();
+            return false;
+        }
+
+        uint32_t remaining = max_wait - waited;
+        uint32_t backoff = radio_random_between(min_backoff, max_backoff);
+        if(backoff > remaining) backoff = remaining;
+        FURI_LOG_I("Radio", "Backoff chosen: %lums", (unsigned long)backoff);
+        meshtastic_log_event(
+            app,
+            LogCategoryPoliteness,
+            "backoff_ms=%lu remaining_ms=%lu",
+            (unsigned long)backoff,
+            (unsigned long)remaining);
+        furi_delay_ms(backoff ? backoff : 1);
+    }
 }
 
 // ============ READ PACKET ============

@@ -24,6 +24,7 @@ typedef enum {
     PORTNUM_AUDIO_APP = 9,
     PORTNUM_DETECTION_SENSOR_APP = 10,
     PORTNUM_ALERT_APP = 11,
+    PORTNUM_TELEMETRY_APP = 67,
     PORTNUM_PRIVATE_APP = 256,
 } Meshtastic_PortNum;
 

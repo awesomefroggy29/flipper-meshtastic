@@ -37,6 +37,6 @@ An app for the flipper zero that works with the rfm95w from Adafruit to create a
 
 
 <h3>now for some information</h3>
-<p>in the inbox when you send a message, it will start out with a "-" next to it. that means its waiting for acknowledgement. if it turns to a "=" then it was not acknowledged. if it turns to a "+", then it was. if you see a "<>" in someone's message, then it was probably an emoji or special character.</p>
+<p>in the inbox when you send a message, it will start out with a "-" next to it. that means its waiting for acknowledgement. if it turns to a "=" then it was not acknowledged. if it turns to a "+", then it was. If a message pops up saying "channel is busy" and it thrns to a "/", then that means there is too much activity being sent through the air and the poiliteness feature timed out, and the message did not send." if you see a "<>" in someone's message, then it was probably an emoji or special character.</p>
 
 

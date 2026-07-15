@@ -9,7 +9,7 @@ This app allows the Flipper Zero to send and receive Meshtastic messages without
 >
 > Radio laws vary by country. If you are outside the United States, check whether 915 MHz LoRa and Meshtastic operation are legal in your area before building or using this project.
 >
-> I am not responsible for any broken flipper zeros or radio modules and injuries from soldering. Proceed at your own risk.
+> I am not responsible for any broken flipper zeros or radio modules and injuries from soldering. Proceed at your own risk. You assume all responsibility for using this project.
 
 ## Before You Begin
 
@@ -65,7 +65,7 @@ This project requires basic soldering and electronics knowledge. Double-check ev
 
 > [!CAUTION]
 > Soldering irons become extremely hot. Learn how to safely solder small electronics before attempting this build.
-> Watching a tutorial video online is HIGHLY recommended
+> Watching a tutorial video online is HIGHLY recommended.
 
 ### 1. Solder the Pin Headers
 
@@ -99,7 +99,7 @@ For the antenna, a straight piece of wire or paperclip approximately **8.2 cm lo
 
 ### 3. Connect the RFM95W to the Flipper Zero
 
-Connect the female end of each female to male pins onto the corresponding male pin on the radio module, and each male end of the jumper wire to the corresponding pin on the flipper.
+Connect the female end of each female-to-male pin onto the corresponding male pin on the radio module, and each male end of the jumper wire to the corresponding pin on the flipper.
 
 | RFM95W pin | Flipper Zero GPIO pin |
 |---|---|
@@ -144,8 +144,8 @@ The Flipper will automatically broadcast its node name and ID on each app start.
 - Custom node name
 - Politeness for the airwaves
 - Client/Client Mute modes
-- Weather recieving
-- Position broadcasting (will broadcast its position if there is a node directly communicatable without 1 or more hops
+- Weather receiving
+- Position broadcasting (will broadcast its position if there is a node directly communicatable without 1 or more hops)
 
 ## Message Status Symbols
 
@@ -201,7 +201,7 @@ Check that:
 - The module is not surrounded by metal
 - Nearby nodes use compatible Meshtastic settings
 
-Coiled antennas are not very recommended as they have poor range, a paperclip antenna may work 
+Coiled antennas are not very recommended as they can have poor range, a paperclip antenna will work better when cut to the right length.
 
 ## Support the Project
 
